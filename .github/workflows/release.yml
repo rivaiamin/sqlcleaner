@@ -24,7 +24,6 @@ jobs:
 
       - name: Run go mod tidy
         run: go mod tidy
-        continue-on-error: true
 
       - name: Build binaries
         run: |
