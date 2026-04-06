@@ -53,13 +53,23 @@ func main() {
 	// Matches dummy tables created for views by mysqldump
 	reDummyView := regexp.MustCompile(`(?i)^--\s+Temporary\s+view\s+structure\s+for\s+view\s+\` + "`" + `?([a-zA-Z0-9_]+)\` + "`" + `?`)
 
-	// Matches View DDL (including mysqldump's comment-wrapped syntax)
-	reCreateView := regexp.MustCompile(`(?i)^(?:/\*\!\d+\s+)?CREATE\s+(?:ALGORITHM|DEFINER|SQL SECURITY|VIEW)`)
+	// Matches View DDL (must include VIEW — not CREATE DEFINER=… PROCEDURE)
+	reCreateView := regexp.MustCompile(`(?i)^(?:/\*\!\d+\s+)?CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\S+\s+|DEFINER\s*=\s*\S+\s+|SQL\s+SECURITY\s+\S+\s+)*VIEW\s+`)
 	reDropView := regexp.MustCompile(`(?i)^(?:/\*\!\d+\s+)?DROP\s+VIEW`)
 
 	// Matches Charset and Collation definitions
 	reCharset := regexp.MustCompile(`(?i)(?:DEFAULT\s+)?(?:CHARACTER\s+SET|CHARSET)\s*=?\s*[a-zA-Z0-9_]+`)
 	reCollate := regexp.MustCompile(`(?i)COLLATE\s*=?\s*[a-zA-Z0-9_]+`)
+
+	// DELIMITER <token> (mysql client; mysqldump uses this around routines)
+	reDelimiter := regexp.MustCompile(`(?i)^DELIMITER\s+(.+)$`)
+
+	// CREATE PROCEDURE / FUNCTION (with optional mysqldump /*!...*/ prefixes)
+	reCreateRoutine := regexp.MustCompile(`(?i)^(?:/\*!\d+\s+)?CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+\s+|SQL\s+SECURITY\s+(?:DEFINER|INVOKER)\s+)*(PROCEDURE|FUNCTION)\s+`)
+	reCreateRoutineSplit := regexp.MustCompile(`(?i)/\*!\d+\s+CREATE\s*\*/\s*/\*!\d+\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+\s+|SQL\s+SECURITY\s+(?:DEFINER|INVOKER)\s+)*(PROCEDURE|FUNCTION)\s+`)
+	reCreateRoutineOneCmt := regexp.MustCompile(`(?i)^/\*!\d+\s+CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+\s+|SQL\s+SECURITY\s+(?:DEFINER|INVOKER)\s+)*(PROCEDURE|FUNCTION)\s+`)
+	// Trailing mysqldump versioned comment before routine terminator (e.g. "END */;;")
+	reTrailVersCmt := regexp.MustCompile(`(?i)\s*/\*![0-9]+\s+.*?\*/\s*$`)
 
 	// 5. Configure the Scanner
 	scanner := bufio.NewScanner(in)
@@ -69,7 +79,22 @@ func main() {
 
 	// State Tracking
 	skippingStatement := false
+	skipStmtTerminator := ";"
+	skippingIsRoutine := false
 	skippingTableData := false
+	// Default SQL statement terminator; overridden by DELIMITER until next DELIMITER
+	stmtDelim := ";"
+	// Buffered "DELIMITER …" to emit before the next non-empty kept line (mysqldump may insert blanks/comments)
+	pendingDelimLine := ""
+	// After stripping a routine, swallow the following "DELIMITER ;" that mysqldump uses to reset the client
+	afterDroppedRoutine := false
+
+	flushPendingDelim := func() {
+		if pendingDelimLine != "" {
+			out.WriteString(pendingDelimLine + "\n")
+			pendingDelimLine = ""
+		}
+	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -80,15 +105,31 @@ func main() {
 		if strings.Contains(upperLine, "GTID_PURGED") {
 			if !strings.HasSuffix(trimmedLine, ";") {
 				skippingStatement = true
+				skipStmtTerminator = ";"
+				skippingIsRoutine = false
 			}
 			continue
 		}
 
 		// --- State Machine Resolution ---
-		// If we are currently skipping a multi-line statement, wait until we see the semicolon
+		// If we are currently skipping a multi-line statement, wait until the line ends with the active terminator
 		if skippingStatement {
-			if strings.HasSuffix(trimmedLine, ";") {
+			done := strings.HasSuffix(trimmedLine, skipStmtTerminator)
+			if done && skippingIsRoutine {
+				// With DELIMITER ;;, inner statements must not use ";;" as EOL or we'd stop early.
+				// Only the final "END [comment] ;;" closes the routine.
+				rest := strings.TrimSpace(strings.TrimSuffix(trimmedLine, skipStmtTerminator))
+				rest = reTrailVersCmt.ReplaceAllString(rest, "")
+				rest = strings.TrimSpace(rest)
+				done = strings.EqualFold(rest, "END")
+			}
+			if done {
 				skippingStatement = false
+				if skippingIsRoutine {
+					afterDroppedRoutine = true
+					skippingIsRoutine = false
+				}
+				stmtDelim = ";"
 			}
 			continue
 		}
@@ -98,19 +139,52 @@ func main() {
 			if strings.HasPrefix(upperLine, "UNLOCK TABLES") {
 				skippingTableData = false
 			}
-			continue 
+			continue
 		}
 
 		// --- Rule 2: Remove Views (and their dummy tables) ---
-		// mysqldump creates dummy tables before views. We dynamically add the view name 
+		// mysqldump creates dummy tables before views. We dynamically add the view name
 		// to our ignore map so the dummy table DDL gets stripped automatically.
 		if match := reDummyView.FindStringSubmatch(trimmedLine); len(match) > 1 {
 			tableMap[match[1]] = true
 			continue
 		}
+
+		// --- Rule 2b: DELIMITER — track stmt terminator; emit normalized "DELIMITER <token>" when keeping SQL ---
+		if m := reDelimiter.FindStringSubmatch(trimmedLine); len(m) > 1 {
+			tok := strings.TrimSpace(m[1])
+			if tok == "" {
+				tok = ";"
+			}
+			stmtDelim = tok
+			if afterDroppedRoutine && tok == ";" {
+				afterDroppedRoutine = false
+				continue
+			}
+			afterDroppedRoutine = false
+			pendingDelimLine = "DELIMITER " + tok
+			continue
+		}
+
+		// --- Rule 2c: Remove stored procedures and functions (before VIEW matching — CREATE DEFINER also starts procedures) ---
+		if reCreateRoutine.MatchString(trimmedLine) || reCreateRoutineSplit.MatchString(trimmedLine) || reCreateRoutineOneCmt.MatchString(trimmedLine) {
+			pendingDelimLine = ""
+			if strings.HasSuffix(trimmedLine, stmtDelim) {
+				afterDroppedRoutine = true
+				stmtDelim = ";"
+			} else {
+				skippingStatement = true
+				skipStmtTerminator = stmtDelim
+				skippingIsRoutine = true
+			}
+			continue
+		}
+
 		if reDropView.MatchString(trimmedLine) || reCreateView.MatchString(trimmedLine) {
 			if !strings.HasSuffix(trimmedLine, ";") {
 				skippingStatement = true
+				skipStmtTerminator = ";"
+				skippingIsRoutine = false
 			}
 			continue
 		}
@@ -125,18 +199,26 @@ func main() {
 				}
 				if !strings.HasSuffix(trimmedLine, ";") {
 					skippingStatement = true
+					skipStmtTerminator = ";"
+					skippingIsRoutine = false
 				}
 				continue
 			}
 		}
 
 		// --- Rule 4: Remove Charset and Collate ---
+		if trimmedLine != "" {
+			flushPendingDelim()
+		}
 		cleanedLine := reCharset.ReplaceAllString(line, "")
 		cleanedLine = reCollate.ReplaceAllString(cleanedLine, "")
-		
-		// Clean up dangling spaces left over before semicolons or commas
-		cleanedLine = strings.ReplaceAll(cleanedLine, " ;", ";")
-		cleanedLine = strings.ReplaceAll(cleanedLine, " ,", ",")
+
+		// Clean up dangling spaces left over before semicolons or commas.
+		// Do not apply to DELIMITER lines: "DELIMITER ;;" contains " ;" before the first semicolon and would become "DELIMITER;;".
+		if !reDelimiter.MatchString(strings.TrimSpace(cleanedLine)) {
+			cleanedLine = strings.ReplaceAll(cleanedLine, " ;", ";")
+			cleanedLine = strings.ReplaceAll(cleanedLine, " ,", ",")
+		}
 
 		// Write the processed line to the new file
 		out.WriteString(cleanedLine + "\n")
@@ -146,6 +228,8 @@ func main() {
 		fmt.Printf("Critical error while reading input file: %v\n", err)
 		os.Exit(1)
 	}
+
+	flushPendingDelim()
 
 	fmt.Println("SQL file successfully cleaned!")
 }
