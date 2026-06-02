@@ -14,6 +14,7 @@ func main() {
 	inputFile := flag.String("in", "", "Path to the input SQL file")
 	outputFile := flag.String("out", "", "Path to the output SQL file")
 	skipTables := flag.String("skip-tables", "", "Comma-separated list of tables to remove (DDL and Data)")
+	keepCharset := flag.Bool("keep-charset", false, "Keep charset/collation clauses (do not strip them)")
 	flag.Parse()
 
 	if *inputFile == "" || *outputFile == "" {
@@ -210,8 +211,11 @@ func main() {
 		if trimmedLine != "" {
 			flushPendingDelim()
 		}
-		cleanedLine := reCharset.ReplaceAllString(line, "")
-		cleanedLine = reCollate.ReplaceAllString(cleanedLine, "")
+		cleanedLine := line
+		if !*keepCharset {
+			cleanedLine = reCharset.ReplaceAllString(cleanedLine, "")
+			cleanedLine = reCollate.ReplaceAllString(cleanedLine, "")
+		}
 
 		// Clean up dangling spaces left over before semicolons or commas.
 		// Do not apply to DELIMITER lines: "DELIMITER ;;" contains " ;" before the first semicolon and would become "DELIMITER;;".
