@@ -53,6 +53,7 @@ Run the tool by passing your input file and desired output file. Optionally excl
 | `-skip-tables` | Comma-separated list of tables to completely remove (no spaces). | No | `-skip-tables users,cache` |
 | `-only-tables` | Comma-separated list of tables to keep; all other table DDL and data are removed. Cannot be combined with `-skip-tables`. | No | `-only-tables users,orders` |
 | `-keep-charset` | Keep `CHARSET` / `CHARACTER SET` and `COLLATE` clauses (do not strip them). | No | `-keep-charset` |
+| `-data-only` | Strip all table DDL (`CREATE TABLE`, `DROP TABLE`); keep `INSERT` and `LOCK TABLES` blocks only. Table filters still apply to data. | No | `-data-only` |
 
 ## How it Works
 

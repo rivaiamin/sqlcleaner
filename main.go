@@ -16,11 +16,12 @@ func main() {
 	skipTables := flag.String("skip-tables", "", "Comma-separated list of tables to remove (DDL and Data)")
 	onlyTables := flag.String("only-tables", "", "Comma-separated list of tables to keep (DDL and Data); all other tables are removed")
 	keepCharset := flag.Bool("keep-charset", false, "Keep charset/collation clauses (do not strip them)")
+	dataOnly := flag.Bool("data-only", false, "Strip table DDL (CREATE/DROP TABLE); keep INSERT and LOCK TABLES blocks only")
 	flag.Parse()
 
 	if *inputFile == "" || *outputFile == "" {
 		fmt.Println("Error: Both input and output files are required.")
-		fmt.Println("Usage: sqlcleaner -in dump.sql -out clean_dump.sql [-skip-tables users,logs | -only-tables users,orders]")
+		fmt.Println("Usage: sqlcleaner -in dump.sql -out clean_dump.sql [-skip-tables users,logs | -only-tables users,orders] [-data-only]")
 		os.Exit(1)
 	}
 
@@ -56,8 +57,13 @@ func main() {
 	defer out.Close()
 
 	// 4. Compile Regex Patterns
-	// Matches `CREATE TABLE foo`, `DROP TABLE foo`, `INSERT INTO foo`, `LOCK TABLES foo`
-	reTable := regexp.MustCompile(`(?i)^(?:CREATE\s+TABLE|DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?|INSERT\s+INTO|LOCK\s+TABLES)\s+(?:IF NOT EXISTS\s+)?\` + "`" + `?([a-zA-Z0-9_]+)\` + "`" + `?`)
+	// Matches `INSERT INTO foo`, `LOCK TABLES foo` (table filters)
+	reTableData := regexp.MustCompile(`(?i)^(?:INSERT\s+INTO|LOCK\s+TABLES)\s+\` + "`" + `?([a-zA-Z0-9_]+)\` + "`" + `?`)
+
+	// Table DDL (optional mysqldump /*!...*/ prefix)
+	reCreateTable := regexp.MustCompile(`(?i)^(?:/\*\!\d+\s+)?CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`)
+	reDropTable := regexp.MustCompile(`(?i)^(?:/\*\!\d+\s+)?DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?`)
+	reTableDDL := regexp.MustCompile(`(?i)^(?:/\*\!\d+\s+)?(?:CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?|DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?)\` + "`" + `?([a-zA-Z0-9_]+)\` + "`" + `?`)
 
 	// Matches dummy tables created for views by mysqldump
 	reDummyView := regexp.MustCompile(`(?i)^--\s+Temporary\s+view\s+structure\s+for\s+view\s+\` + "`" + `?([a-zA-Z0-9_]+)\` + "`" + `?`)
@@ -200,14 +206,31 @@ func main() {
 			continue
 		}
 
-		// --- Rule 3: Remove Specific Table DDL and Data ---
-		if match := reTable.FindStringSubmatch(trimmedLine); len(match) > 1 {
-			tableName := match[1]
-			if shouldSkipTable(tableName) {
-				if strings.HasPrefix(upperLine, "LOCK TABLES") {
-					skippingTableData = true
-					continue
-				}
+		// --- Rule 2d: Data-only — strip table DDL, keep INSERT / LOCK TABLES ---
+		if *dataOnly && (reCreateTable.MatchString(trimmedLine) || reDropTable.MatchString(trimmedLine)) {
+			if !strings.HasSuffix(trimmedLine, ";") {
+				skippingStatement = true
+				skipStmtTerminator = ";"
+				skippingIsRoutine = false
+			}
+			continue
+		}
+
+		// --- Rule 3: Remove Specific Table DDL and/or Data ---
+		if match := reTableData.FindStringSubmatch(trimmedLine); len(match) > 1 && shouldSkipTable(match[1]) {
+			if strings.HasPrefix(upperLine, "LOCK TABLES") {
+				skippingTableData = true
+				continue
+			}
+			if !strings.HasSuffix(trimmedLine, ";") {
+				skippingStatement = true
+				skipStmtTerminator = ";"
+				skippingIsRoutine = false
+			}
+			continue
+		}
+		if !*dataOnly {
+			if match := reTableDDL.FindStringSubmatch(trimmedLine); len(match) > 1 && shouldSkipTable(match[1]) {
 				if !strings.HasSuffix(trimmedLine, ";") {
 					skippingStatement = true
 					skipStmtTerminator = ";"
