@@ -14,22 +14,30 @@ func main() {
 	inputFile := flag.String("in", "", "Path to the input SQL file")
 	outputFile := flag.String("out", "", "Path to the output SQL file")
 	skipTables := flag.String("skip-tables", "", "Comma-separated list of tables to remove (DDL and Data)")
+	onlyTables := flag.String("only-tables", "", "Comma-separated list of tables to keep (DDL and Data); all other tables are removed")
 	keepCharset := flag.Bool("keep-charset", false, "Keep charset/collation clauses (do not strip them)")
 	flag.Parse()
 
 	if *inputFile == "" || *outputFile == "" {
 		fmt.Println("Error: Both input and output files are required.")
-		fmt.Println("Usage: sqlcleaner -in dump.sql -out clean_dump.sql -skip-tables users,logs,cache")
+		fmt.Println("Usage: sqlcleaner -in dump.sql -out clean_dump.sql [-skip-tables users,logs | -only-tables users,orders]")
 		os.Exit(1)
 	}
 
-	// 2. Parse tables to skip into a map for O(1) lookups
-	tableMap := make(map[string]bool)
-	for _, t := range strings.Split(*skipTables, ",") {
-		t = strings.TrimSpace(t)
-		if t != "" {
-			tableMap[t] = true
+	// 2. Parse table filters into maps for O(1) lookups
+	skipMap := parseTableList(*skipTables)
+	onlyMap := parseTableList(*onlyTables)
+	onlyMode := len(onlyMap) > 0
+	if onlyMode && len(skipMap) > 0 {
+		fmt.Println("Error: -skip-tables and -only-tables cannot be used together.")
+		os.Exit(1)
+	}
+
+	shouldSkipTable := func(name string) bool {
+		if onlyMode {
+			return !onlyMap[name]
 		}
+		return skipMap[name]
 	}
 
 	// 3. Open Input and Output files
@@ -147,7 +155,9 @@ func main() {
 		// mysqldump creates dummy tables before views. We dynamically add the view name
 		// to our ignore map so the dummy table DDL gets stripped automatically.
 		if match := reDummyView.FindStringSubmatch(trimmedLine); len(match) > 1 {
-			tableMap[match[1]] = true
+			if !onlyMode {
+				skipMap[match[1]] = true
+			}
 			continue
 		}
 
@@ -193,7 +203,7 @@ func main() {
 		// --- Rule 3: Remove Specific Table DDL and Data ---
 		if match := reTable.FindStringSubmatch(trimmedLine); len(match) > 1 {
 			tableName := match[1]
-			if tableMap[tableName] {
+			if shouldSkipTable(tableName) {
 				if strings.HasPrefix(upperLine, "LOCK TABLES") {
 					skippingTableData = true
 					continue
@@ -236,4 +246,15 @@ func main() {
 	flushPendingDelim()
 
 	fmt.Println("SQL file successfully cleaned!")
+}
+
+func parseTableList(csv string) map[string]bool {
+	m := make(map[string]bool)
+	for _, t := range strings.Split(csv, ",") {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			m[t] = true
+		}
+	}
+	return m
 }

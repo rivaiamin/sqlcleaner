@@ -37,11 +37,11 @@ mv sqlcleaner /usr/local/bin/
 
 ## Usage
 
-Run the tool by passing your input file, desired output file, and a comma-separated list of tables you want to exclude.
+Run the tool by passing your input file and desired output file. Optionally exclude specific tables (`-skip-tables`) or keep only a subset (`-only-tables`; mutually exclusive with `-skip-tables`).
 
 ```bash
 ./sqlcleaner -in dirty_dump.sql -out clean_dump.sql -skip-tables "logs,sessions,audit_trail"
-
+./sqlcleaner -in dirty_dump.sql -out subset.sql -only-tables "users,orders"
 ```
 
 ### Command Line Flags
@@ -51,6 +51,7 @@ Run the tool by passing your input file, desired output file, and a comma-separa
 | `-in` | Path to the source `.sql` file. | Yes | `-in dump.sql` |
 | `-out` | Path where the cleaned `.sql` file will be saved. | Yes | `-out cleaned.sql` |
 | `-skip-tables` | Comma-separated list of tables to completely remove (no spaces). | No | `-skip-tables users,cache` |
+| `-only-tables` | Comma-separated list of tables to keep; all other table DDL and data are removed. Cannot be combined with `-skip-tables`. | No | `-only-tables users,orders` |
 | `-keep-charset` | Keep `CHARSET` / `CHARACTER SET` and `COLLATE` clauses (do not strip them). | No | `-keep-charset` |
 
 ## How it Works
